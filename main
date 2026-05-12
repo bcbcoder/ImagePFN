@@ -5,7 +5,7 @@ import torch
 import matplotlib.pyplot as plt
 from torch.utils.data import IterableDataset, DataLoader
 
-from banks import SyntheticBankStreamer
+from image_bank import SyntheticBankStreamer
 from rule_generator import SyntheticRuleTaskGenerator
 from vit import (
     ImagePFN,

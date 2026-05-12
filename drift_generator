@@ -1,0 +1,1307 @@
+
+import os
+import sys
+import math
+import random
+import urllib.request
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as T
+import torchvision.utils as vutils
+import matplotlib.pyplot as plt
+
+from tqdm.auto import tqdm
+from torch.utils.data import DataLoader, Subset
+from torchvision.models import resnet50
+
+
+# ============================================================
+# Device selection
+# ============================================================
+
+IN_COLAB = (
+    "google.colab" in sys.modules
+    or os.environ.get("COLAB_GPU") is not None
+    or os.environ.get("COLAB_TPU_ADDR") is not None
+)
+
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif (not IN_COLAB) and torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
+
+print(f"Using device: {DEVICE} (IN_COLAB={IN_COLAB})")
+
+if IN_COLAB and DEVICE.type != "cuda":
+    print(
+        "[Warning] Colab is not running with GPU enabled. "
+        "Please select 'Runtime -> Change runtime type -> GPU' and re-run."
+    )
+
+
+# ============================================================
+# Config
+# ============================================================
+
+DATA_ROOT = "./data"
+OUT_DIR = "./stl_moco_feature_drift_relational_diversity_outputs"
+SAMPLE_DIR = os.path.join(OUT_DIR, "samples")
+CHECKPOINT_DIR = os.path.join(OUT_DIR, "checkpoints")
+MOCO_DIR = os.path.join(OUT_DIR, "moco_weights")
+
+IMAGE_SIZE = 32
+DATASET_SIZE = 10000
+RANDOM_SEED = 123
+
+STEPS = 50000
+DATA_BATCH_SIZE = 2048
+GEN_BATCH_SIZE = 2048
+LR = 2e-4
+IN_DIM = 32
+HIDDEN = 256
+SEED = 42
+
+DRIFT_TEMPERATURE = 0.25
+DRIFT_LOSS_WEIGHT = 1.0
+
+RELATIONAL_LOSS_WEIGHT = 1e-4
+
+DIVERSITY_LOSS_WEIGHT = 1e-3
+DIVERSITY_SIM_CEILING = 0.65
+
+# MoCo v2 ResNet-50 checkpoint.
+DOWNLOAD_MOCO_IF_MISSING = True
+MOCO_CHECKPOINT_URL = (
+    "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/"
+    "moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
+)
+MOCO_CHECKPOINT_PATH = os.path.join(MOCO_DIR, "moco_v2_800ep_pretrain.pth.tar")
+
+# layer1/layer2/layer3 are safer for 32x32 images than relying heavily on layer4.
+FEATURE_LAYERS = ["layer1", "layer2", "layer3"]
+
+FEATURE_WEIGHTS = {
+    "layer1": 1.0,
+    "layer2": 0.5,
+    "layer3": 0.25,
+}
+
+PLOT_EVERY = 20
+SAVE_EVERY = 20
+
+RELATIONAL_VIS_NUM_IMAGES = 12
+RELATIONAL_VIS_TARGET_SIMS = [
+    1.00,
+    0.80,
+    0.60,
+    0.40,
+    0.20,
+    0.00,
+    -0.20,
+    -0.40,
+    -0.60,
+    -0.80,
+    -0.95,
+    -1.00,
+]
+
+NUM_WORKERS = 0
+
+os.makedirs(SAMPLE_DIR, exist_ok=True)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(MOCO_DIR, exist_ok=True)
+
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# STL loader
+# ============================================================
+
+def build_stl_loader(batch_size):
+    tfm = T.Compose([
+        T.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        T.ToTensor(),
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+
+    dataset = torchvision.datasets.STL10(
+        root=DATA_ROOT,
+        split="unlabeled",
+        download=True,
+        transform=tfm,
+    )
+
+    g = torch.Generator().manual_seed(RANDOM_SEED)
+    perm = torch.randperm(len(dataset), generator=g)[:DATASET_SIZE]
+    subset = Subset(dataset, perm.tolist())
+
+    loader = DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=(DEVICE.type == "cuda"),
+        drop_last=True,
+    )
+
+    return loader
+
+
+# ============================================================
+# MLP generator
+# ============================================================
+
+class MLP(nn.Module):
+    """
+    Simple MLP generator:
+
+        z -> hidden -> hidden -> hidden -> flattened image
+
+    z is the only input.
+    There is no separate y vector.
+    """
+
+    def __init__(self, in_dim=32, hidden=256, out_dim=3 * IMAGE_SIZE * IMAGE_SIZE):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+
+def flat_to_img(x_flat):
+    """
+    Convert flattened generated output to image.
+
+    MLP output:
+        [B, 3*H*W]
+
+    Image output:
+        [B, 3, H, W] in [-1, 1]
+    """
+    x_img = x_flat.view(x_flat.shape[0], 3, IMAGE_SIZE, IMAGE_SIZE)
+    x_img = torch.tanh(x_img)
+    return x_img
+
+
+
+def download_file_if_missing(url, path):
+    if os.path.exists(path):
+        print(f"MoCo checkpoint already exists: {path}")
+        return
+
+    if not DOWNLOAD_MOCO_IF_MISSING:
+        raise FileNotFoundError(
+            f"MoCo checkpoint not found at {path}. "
+            f"Set DOWNLOAD_MOCO_IF_MISSING=True or manually place the file there."
+        )
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    print(f"Downloading MoCo checkpoint to: {path}")
+    print("This can take a little while the first time.")
+
+    urllib.request.urlretrieve(url, path)
+
+    print(f"Downloaded MoCo checkpoint: {path}")
+
+
+def load_moco_v2_resnet50(checkpoint_path):
+    
+    model = resnet50(weights=None)
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+
+    if "state_dict" in ckpt:
+        state_dict = ckpt["state_dict"]
+    else:
+        state_dict = ckpt
+
+    new_state_dict = {}
+
+    for k, v in state_dict.items():
+        # Keep only the query encoder.
+        if k.startswith("module.encoder_q."):
+            new_k = k.replace("module.encoder_q.", "")
+
+            # Skip MoCo projection head / classifier.
+            if new_k.startswith("fc."):
+                continue
+
+            new_state_dict[new_k] = v
+
+    missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+
+
+    if len(missing) > 0:
+        print("First few missing keys:")
+        for k in missing[:10]:
+            print(f"  {k}")
+
+    if len(unexpected) > 0:
+        print("First few unexpected keys:")
+        for k in unexpected[:10]:
+            print(f"  {k}")
+
+    return model
+
+
+# ============================================================
+# Frozen MoCo feature extractor
+# ============================================================
+
+class FrozenMoCoResNet50Features(nn.Module):
+    """
+    Frozen MoCo v2 ResNet-50 feature extractor.
+
+    Input:
+        images in [-1, 1], shape [B, 3, H, W]
+
+    Output:
+        dict of pooled, normalized feature vectors:
+            {
+                "layer1": [B, C1],
+                "layer2": [B, C2],
+                "layer3": [B, C3],
+            }
+
+    The same feature extractor is used for:
+        - drift loss
+        - relational loss
+        - diversity loss
+    """
+
+    def __init__(
+        self,
+        layers=("layer1", "layer2", "layer3"),
+        checkpoint_path=MOCO_CHECKPOINT_PATH,
+        checkpoint_url=MOCO_CHECKPOINT_URL,
+    ):
+        super().__init__()
+
+        download_file_if_missing(checkpoint_url, checkpoint_path)
+        backbone = load_moco_v2_resnet50(checkpoint_path)
+
+        self.stem = nn.Sequential(
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+            backbone.maxpool,
+        )
+
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+
+        self.layers = set(layers)
+
+        for p in self.parameters():
+            p.requires_grad = False
+
+        self.eval()
+
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def forward(self, images):
+        x = (images + 1.0) / 2.0
+        x = (x - self.mean) / self.std
+
+        feats = {}
+
+        x = self.stem(x)
+
+        x = self.layer1(x)
+        if "layer1" in self.layers:
+            feats["layer1"] = self._pool_norm(x)
+
+        x = self.layer2(x)
+        if "layer2" in self.layers:
+            feats["layer2"] = self._pool_norm(x)
+
+        x = self.layer3(x)
+        if "layer3" in self.layers:
+            feats["layer3"] = self._pool_norm(x)
+
+        x = self.layer4(x)
+        if "layer4" in self.layers:
+            feats["layer4"] = self._pool_norm(x)
+
+        return feats
+
+    def _pool_norm(self, x):
+        x = F.adaptive_avg_pool2d(x, output_size=1).flatten(1)
+        x = F.normalize(x, dim=1)
+        return x
+
+
+# ============================================================
+# Feature-space drifting loss
+# ============================================================
+
+def pairwise_l2(a, b):
+    return torch.cdist(a, b, p=2)
+
+
+def compute_drift_target_features(
+    gen_feat,
+    real_feat,
+    temperature=0.25,
+):
+    """
+    Computes:
+
+        target = stopgrad(gen_feat + V)
+
+    where:
+
+        V = pos_mean - neg_mean
+
+    pos_mean:
+        nearby real features.
+
+    neg_mean:
+        nearby generated features.
+
+    This gives attraction toward real STL features and repulsion from
+    nearby generated features.
+    """
+
+    with torch.no_grad():
+        gen_detach = gen_feat.detach()
+        real_detach = real_feat.detach()
+
+        dist_pos = pairwise_l2(gen_detach, real_detach)
+        w_pos = F.softmax(-dist_pos / temperature, dim=1)
+        pos_mean = w_pos @ real_detach
+
+        dist_neg = pairwise_l2(gen_detach, gen_detach)
+        w_neg = F.softmax(-dist_neg / temperature, dim=1)
+        neg_mean = w_neg @ gen_detach
+
+        drift = pos_mean - neg_mean
+        target = gen_detach + drift
+
+    return target
+
+
+def drifting_feature_loss(
+    gen_features,
+    real_features,
+    temperature=0.25,
+    feature_weights=None,
+):
+    """
+    Multi-layer feature-space drifting loss.
+
+    For each feature layer:
+
+        target = stopgrad(gen_feature + drift)
+        loss = MSE(gen_feature, target)
+
+    Then the layer losses are combined with FEATURE_WEIGHTS.
+    """
+
+    total_loss = 0.0
+    logs = {}
+
+    if feature_weights is None:
+        feature_weights = {k: 1.0 for k in gen_features.keys()}
+
+    weight_sum = 0.0
+
+    for name in gen_features.keys():
+        gen_feat = gen_features[name]
+        real_feat = real_features[name]
+
+        target = compute_drift_target_features(
+            gen_feat=gen_feat,
+            real_feat=real_feat,
+            temperature=temperature,
+        )
+
+        loss = F.mse_loss(gen_feat, target)
+
+        w = float(feature_weights.get(name, 1.0))
+
+        total_loss = total_loss + w * loss
+        weight_sum += w
+
+        with torch.no_grad():
+            sim_to_real = gen_feat @ real_feat.T
+            nn_sim = sim_to_real.max(dim=1).values.mean()
+            avg_real_sim = sim_to_real.mean()
+
+        logs[f"drift_{name}_loss"] = float(loss.item())
+        logs[f"drift_{name}_nn_sim"] = float(nn_sim.item())
+        logs[f"drift_{name}_avg_real_sim"] = float(avg_real_sim.item())
+
+    total_loss = total_loss / max(weight_sum, 1e-8)
+
+    return total_loss, logs
+
+
+# ============================================================
+# Z-based relational loss
+# ============================================================
+
+def cosine_similarity_matrix(x, eps=1e-8):
+    """
+    Computes pairwise cosine similarity.
+    """
+    x = F.normalize(x, dim=1, eps=eps)
+    return x @ x.T
+
+
+def offdiag_mask(B, device):
+    return ~torch.eye(B, dtype=torch.bool, device=device)
+
+
+def offdiag_mse(sim_a, sim_b):
+    """
+    MSE between off-diagonal entries of two similarity matrices.
+    """
+    B = sim_a.shape[0]
+    mask = offdiag_mask(B, sim_a.device)
+
+    return F.mse_loss(
+        sim_a[mask],
+        sim_b[mask],
+    )
+
+
+def batchwise_relational_loss(
+    gen_features,
+    z,
+    feature_weights=None,
+):
+    """
+    Batchwise relational loss.
+
+    Uses the same z vector that generated the image.
+
+    Target:
+        sim_z[i, j] = cosine(z_i, z_j)
+
+    Image side:
+        sim_img_layer[i, j] = cosine(phi_layer(img_i), phi_layer(img_j))
+
+    Objective:
+        sim_img_layer should match sim_z.
+    """
+
+    if feature_weights is None:
+        feature_weights = {k: 1.0 for k in gen_features.keys()}
+
+    z_norm = F.normalize(z, dim=1, eps=1e-8)
+    sim_z = z_norm @ z_norm.T
+
+    total_loss = 0.0
+    weight_sum = 0.0
+    logs = {}
+
+    for name, feat in gen_features.items():
+        sim_img = cosine_similarity_matrix(feat)
+        loss = offdiag_mse(sim_img, sim_z)
+
+        w = float(feature_weights.get(name, 1.0))
+
+        total_loss = total_loss + w * loss
+        weight_sum += w
+
+        with torch.no_grad():
+            B = sim_img.shape[0]
+            mask = offdiag_mask(B, sim_img.device)
+
+            img_off = sim_img[mask]
+            z_off = sim_z[mask]
+
+            img_mean = img_off.mean()
+            z_mean = z_off.mean()
+
+            img_std = img_off.std(unbiased=False)
+            z_std = z_off.std(unbiased=False)
+
+            corr_num = ((img_off - img_mean) * (z_off - z_mean)).mean()
+            corr_den = img_std * z_std + 1e-8
+            corr = corr_num / corr_den
+
+        logs[f"rel_{name}_loss"] = float(loss.item())
+        logs[f"rel_{name}_corr"] = float(corr.item())
+        logs[f"rel_{name}_img_sim_mean"] = float(img_mean.item())
+        logs[f"rel_{name}_z_sim_mean"] = float(z_mean.item())
+
+    total_loss = total_loss / max(weight_sum, 1e-8)
+
+    return total_loss, logs
+
+
+# ============================================================
+# Diversity ceiling loss
+# ============================================================
+
+def batchwise_diversity_ceiling_loss(
+    gen_features,
+    feature_weights=None,
+    ceiling=DIVERSITY_SIM_CEILING,
+):
+    """
+    Batchwise diversity loss with a similarity ceiling.
+
+    For each feature layer:
+
+        sim_img = cosine(phi(img_i), phi(img_j))
+
+    For off-diagonal pairs only, penalize:
+
+        relu(sim_img - ceiling)^2
+
+    This means:
+        - if two generated images are below the similarity ceiling, no penalty
+        - if they become too similar, penalty increases smoothly
+
+    """
+
+    if feature_weights is None:
+        feature_weights = {k: 1.0 for k in gen_features.keys()}
+
+    total_loss = 0.0
+    weight_sum = 0.0
+    logs = {}
+
+    for name, feat in gen_features.items():
+        sim_img = cosine_similarity_matrix(feat)
+
+        B = sim_img.shape[0]
+        mask = offdiag_mask(B, sim_img.device)
+        sim_off = sim_img[mask]
+
+        penalty = F.relu(sim_off - ceiling)
+        loss = (penalty ** 2).mean()
+
+        w = float(feature_weights.get(name, 1.0))
+
+        total_loss = total_loss + w * loss
+        weight_sum += w
+
+        with torch.no_grad():
+            frac_above = (sim_off > ceiling).float().mean()
+            sim_mean = sim_off.mean()
+            sim_max = sim_off.max()
+            penalty_mean = penalty.mean()
+
+        logs[f"div_{name}_loss"] = float(loss.item())
+        logs[f"div_{name}_sim_mean"] = float(sim_mean.item())
+        logs[f"div_{name}_sim_max"] = float(sim_max.item())
+        logs[f"div_{name}_frac_above"] = float(frac_above.item())
+        logs[f"div_{name}_penalty_mean"] = float(penalty_mean.item())
+
+    total_loss = total_loss / max(weight_sum, 1e-8)
+
+    return total_loss, logs
+
+
+# ============================================================
+# Cosine-controlled visualization vectors
+# ============================================================
+
+def make_cosine_similarity_row_vectors(
+    in_dim,
+    device,
+    target_sims=RELATIONAL_VIS_TARGET_SIMS,
+):
+    """
+    Creates a single row of unit vectors with controlled cosine similarity
+    relative to the first vector.
+
+    First vector:
+        e1 = [1, 0, 0, ..., 0]
+
+    For target cosine c:
+        v = [c, sqrt(1-c^2), 0, ..., 0]
+
+    This gives:
+        cosine(e1, v) = c
+    """
+
+    if in_dim < 2:
+        raise ValueError("in_dim must be at least 2 for cosine-controlled visualization.")
+
+    vectors = []
+
+    for c in target_sims:
+        c = float(max(-1.0, min(1.0, c)))
+        radius = math.sqrt(max(0.0, 1.0 - c * c))
+
+        v = torch.zeros(in_dim, device=device, dtype=torch.float32)
+        v[0] = c
+        v[1] = radius
+
+        vectors.append(v)
+
+    z_vis = torch.stack(vectors, dim=0)
+    z_vis = F.normalize(z_vis, dim=1, eps=1e-8)
+
+    return z_vis
+
+
+# ============================================================
+# Save helpers
+# ============================================================
+
+def denorm(x):
+    return (x.clamp(-1, 1) + 1.0) / 2.0
+
+
+def save_image_comparison(real_img, gen_img, step, epoch):
+    real_path = os.path.join(SAMPLE_DIR, f"real_epoch_{epoch:04d}_step_{step:06d}.png")
+    gen_path = os.path.join(SAMPLE_DIR, f"generated_epoch_{epoch:04d}_step_{step:06d}.png")
+    comparison_path = os.path.join(SAMPLE_DIR, f"comparison_epoch_{epoch:04d}_step_{step:06d}.png")
+
+    real_grid = denorm(real_img[:64].detach().cpu())
+    gen_grid = denorm(gen_img[:64].detach().cpu())
+
+    vutils.save_image(real_grid, real_path, nrow=8, padding=2)
+    vutils.save_image(gen_grid, gen_path, nrow=8, padding=2)
+
+    comparison = torch.cat([real_grid[:32], gen_grid[:32]], dim=0)
+    vutils.save_image(comparison, comparison_path, nrow=8, padding=2)
+
+    print(f"Saved samples:")
+    print(f"  {real_path}")
+    print(f"  {gen_path}")
+    print(f"  {comparison_path}")
+
+
+def save_relational_cosine_row(model, step, epoch, in_dim):
+    """
+    Saves a single-row cosine-controlled visual.
+
+    Columns are generated from z vectors with target cosine similarity
+    to the first/reference vector.
+
+    Since there is only one z-based relational space, this is one row.
+    """
+
+    model.eval()
+
+    with torch.no_grad():
+        z_row = make_cosine_similarity_row_vectors(
+            in_dim=in_dim,
+            device=DEVICE,
+            target_sims=RELATIONAL_VIS_TARGET_SIMS,
+        )
+
+        gen_raw = model(z_row)
+        gen_img = flat_to_img(gen_raw)
+        gen_img = denorm(gen_img.detach().cpu())
+
+    save_path = os.path.join(
+        SAMPLE_DIR,
+        f"relational_cosine_row_epoch_{epoch:04d}_step_{step:06d}.png",
+    )
+
+    n = gen_img.shape[0]
+
+    plt.figure(figsize=(n * 2.0, 2.4))
+    plt.suptitle(
+        "One-row z-cosine visual | columns decrease cosine similarity to first image",
+        fontsize=12,
+    )
+
+    for i in range(n):
+        sim = RELATIONAL_VIS_TARGET_SIMS[i]
+
+        plt.subplot(1, n, i + 1)
+        plt.imshow(gen_img[i].permute(1, 2, 0).numpy())
+        plt.title(f"{sim:.2f}", fontsize=8)
+        plt.axis("off")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+
+    print(f"Saved relational cosine row: {save_path}")
+
+    model.train()
+
+
+def save_loss_curve(
+    step_total_loss_history,
+    step_drift_loss_history,
+    step_rel_loss_history,
+    step_div_loss_history,
+    epoch_total_loss_history,
+    epoch_drift_loss_history,
+    epoch_rel_loss_history,
+    epoch_div_loss_history,
+):
+    step_path = os.path.join(OUT_DIR, "step_loss_curve.png")
+    epoch_path = os.path.join(OUT_DIR, "epoch_loss_curve.png")
+
+    step_drift_path = os.path.join(OUT_DIR, "step_drift_loss_curve.png")
+    epoch_drift_path = os.path.join(OUT_DIR, "epoch_drift_loss_curve.png")
+
+    step_rel_path = os.path.join(OUT_DIR, "step_relational_loss_curve.png")
+    epoch_rel_path = os.path.join(OUT_DIR, "epoch_relational_loss_curve.png")
+
+    step_div_path = os.path.join(OUT_DIR, "step_diversity_loss_curve.png")
+    epoch_div_path = os.path.join(OUT_DIR, "epoch_diversity_loss_curve.png")
+
+    if len(step_total_loss_history) > 0:
+        plt.figure(figsize=(7, 4))
+        plt.plot(step_total_loss_history, label="total", alpha=0.8)
+        plt.plot(step_drift_loss_history, label="drift", alpha=0.8)
+        plt.plot(step_rel_loss_history, label="relational", alpha=0.8)
+        plt.plot(step_div_loss_history, label="diversity", alpha=0.8)
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("Step Loss Curves")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        if max(step_total_loss_history) > 0:
+            plt.yscale("log")
+
+        plt.tight_layout()
+        plt.savefig(step_path, dpi=150)
+        plt.close()
+        print(f"Saved step loss curve: {step_path}")
+
+    if len(epoch_total_loss_history) > 0:
+        plt.figure(figsize=(7, 4))
+        plt.plot(epoch_total_loss_history, marker="o", label="total", alpha=0.8)
+        plt.plot(epoch_drift_loss_history, marker="o", label="drift", alpha=0.8)
+        plt.plot(epoch_rel_loss_history, marker="o", label="relational", alpha=0.8)
+        plt.plot(epoch_div_loss_history, marker="o", label="diversity", alpha=0.8)
+        plt.xlabel("Epoch")
+        plt.ylabel("Average Loss")
+        plt.title("Epoch-Average Loss Curves")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        if max(epoch_total_loss_history) > 0:
+            plt.yscale("log")
+
+        plt.tight_layout()
+        plt.savefig(epoch_path, dpi=150)
+        plt.close()
+        print(f"Saved epoch loss curve: {epoch_path}")
+
+    if len(step_drift_loss_history) > 0:
+        plt.figure(figsize=(7, 4))
+        plt.plot(step_drift_loss_history, label="drift", alpha=0.85)
+        plt.xlabel("Step")
+        plt.ylabel("Drift Loss")
+        plt.title("Step Drift Loss Curve")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        if max(step_drift_loss_history) > 0:
+            plt.yscale("log")
+
+        plt.tight_layout()
+        plt.savefig(step_drift_path, dpi=150)
+        plt.close()
+        print(f"Saved step drift loss curve: {step_drift_path}")
+
+    if len(epoch_drift_loss_history) > 0:
+        plt.figure(figsize=(7, 4))
+        plt.plot(epoch_drift_loss_history, marker="o", label="drift", alpha=0.85)
+        plt.xlabel("Epoch")
+        plt.ylabel("Average Drift Loss")
+        plt.title("Epoch-Average Drift Loss Curve")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        if max(epoch_drift_loss_history) > 0:
+            plt.yscale("log")
+
+        plt.tight_layout()
+        plt.savefig(epoch_drift_path, dpi=150)
+        plt.close()
+        print(f"Saved epoch drift loss curve: {epoch_drift_path}")
+
+    if len(step_rel_loss_history) > 0:
+        plt.figure(figsize=(7, 4))
+        plt.plot(step_rel_loss_history, label="relational", alpha=0.85)
+        plt.xlabel("Step")
+        plt.ylabel("Relational Loss")
+        plt.title("Step Relational Loss Curve")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        if max(step_rel_loss_history) > 0:
+            plt.yscale("log")
+
+        plt.tight_layout()
+        plt.savefig(step_rel_path, dpi=150)
+        plt.close()
+        print(f"Saved step relational loss curve: {step_rel_path}")
+
+    if len(epoch_rel_loss_history) > 0:
+        plt.figure(figsize=(7, 4))
+        plt.plot(epoch_rel_loss_history, marker="o", label="relational", alpha=0.85)
+        plt.xlabel("Epoch")
+        plt.ylabel("Average Relational Loss")
+        plt.title("Epoch-Average Relational Loss Curve")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        if max(epoch_rel_loss_history) > 0:
+            plt.yscale("log")
+
+        plt.tight_layout()
+        plt.savefig(epoch_rel_path, dpi=150)
+        plt.close()
+        print(f"Saved epoch relational loss curve: {epoch_rel_path}")
+
+    if len(step_div_loss_history) > 0:
+        plt.figure(figsize=(7, 4))
+        plt.plot(step_div_loss_history, label="diversity", alpha=0.85)
+        plt.xlabel("Step")
+        plt.ylabel("Diversity Loss")
+        plt.title("Step Diversity Ceiling Loss Curve")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        if max(step_div_loss_history) > 0:
+            plt.yscale("log")
+
+        plt.tight_layout()
+        plt.savefig(step_div_path, dpi=150)
+        plt.close()
+        print(f"Saved step diversity loss curve: {step_div_path}")
+
+    if len(epoch_div_loss_history) > 0:
+        plt.figure(figsize=(7, 4))
+        plt.plot(epoch_div_loss_history, marker="o", label="diversity", alpha=0.85)
+        plt.xlabel("Epoch")
+        plt.ylabel("Average Diversity Loss")
+        plt.title("Epoch-Average Diversity Ceiling Loss Curve")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        if max(epoch_div_loss_history) > 0:
+            plt.yscale("log")
+
+        plt.tight_layout()
+        plt.savefig(epoch_div_path, dpi=150)
+        plt.close()
+        print(f"Saved epoch diversity loss curve: {epoch_div_path}")
+
+
+def save_checkpoint(model, opt, step, epoch, in_dim, hidden, temp):
+    path = os.path.join(CHECKPOINT_DIR, f"model_epoch_{epoch:04d}_step_{step:06d}.pth")
+
+    torch.save(
+        {
+            "step": step,
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "IMAGE_SIZE": IMAGE_SIZE,
+            "IN_DIM": in_dim,
+            "HIDDEN": hidden,
+            "DRIFT_TEMPERATURE": temp,
+            "DRIFT_LOSS_WEIGHT": DRIFT_LOSS_WEIGHT,
+            "RELATIONAL_LOSS_WEIGHT": RELATIONAL_LOSS_WEIGHT,
+            "DIVERSITY_LOSS_WEIGHT": DIVERSITY_LOSS_WEIGHT,
+            "DIVERSITY_SIM_CEILING": DIVERSITY_SIM_CEILING,
+            "FEATURE_BACKBONE": "moco_v2_resnet50",
+            "FEATURE_LAYERS": FEATURE_LAYERS,
+            "FEATURE_WEIGHTS": FEATURE_WEIGHTS,
+            "MOCO_CHECKPOINT_PATH": MOCO_CHECKPOINT_PATH,
+        },
+        path,
+    )
+
+    print(f"Saved checkpoint: {path}")
+
+
+# ============================================================
+# Training
+# ============================================================
+
+def train_stl_feature_drift_relational_diversity(
+    steps=STEPS,
+    data_batch_size=DATA_BATCH_SIZE,
+    gen_batch_size=GEN_BATCH_SIZE,
+    lr=LR,
+    temp=DRIFT_TEMPERATURE,
+    in_dim=IN_DIM,
+    hidden=HIDDEN,
+    seed=SEED,
+):
+    """
+    Trains for a fixed number of optimizer steps, but prints a true
+    average across all batches within each completed epoch.
+
+    With:
+        DATASET_SIZE = 10000
+        batch_size = 2048
+        drop_last = True
+
+    each epoch has floor(10000 / 2048) = 4 optimizer steps.
+
+    Loss:
+        total_loss =
+            DRIFT_LOSS_WEIGHT * drift_loss
+            + RELATIONAL_LOSS_WEIGHT * relational_loss
+            + DIVERSITY_LOSS_WEIGHT * diversity_loss
+    """
+
+    seed_everything(seed)
+
+    out_dim = 3 * IMAGE_SIZE * IMAGE_SIZE
+
+    model = MLP(
+        in_dim=in_dim,
+        hidden=hidden,
+        out_dim=out_dim,
+    ).to(DEVICE)
+
+    feature_extractor = FrozenMoCoResNet50Features(
+        layers=FEATURE_LAYERS,
+        checkpoint_path=MOCO_CHECKPOINT_PATH,
+        checkpoint_url=MOCO_CHECKPOINT_URL,
+    ).to(DEVICE)
+
+    feature_extractor.eval()
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    loader = build_stl_loader(batch_size=data_batch_size)
+
+    step_total_loss_history = []
+    step_drift_loss_history = []
+    step_rel_loss_history = []
+    step_div_loss_history = []
+
+    epoch_total_loss_history = []
+    epoch_drift_loss_history = []
+    epoch_rel_loss_history = []
+    epoch_div_loss_history = []
+
+    global_step = 0
+    epoch = 0
+
+    fixed_z = torch.randn(64, in_dim, device=DEVICE)
+
+    print("=" * 80)
+    print("Training STL feature-space drift + z-relational + diversity model")
+    print("=" * 80)
+    print(f"feature backbone: MoCo v2 ResNet-50")
+    print(f"steps: {steps}")
+    print(f"data_batch_size: {data_batch_size}")
+    print(f"gen_batch_size: {gen_batch_size}")
+    print(f"lr: {lr}")
+    print(f"drift temp: {temp}")
+    print(f"in_dim: {in_dim}")
+    print(f"hidden: {hidden}")
+    print(f"IMAGE_SIZE: {IMAGE_SIZE}")
+    print(f"out_dim: {out_dim}")
+    print(f"DRIFT_LOSS_WEIGHT: {DRIFT_LOSS_WEIGHT}")
+    print(f"RELATIONAL_LOSS_WEIGHT: {RELATIONAL_LOSS_WEIGHT}")
+    print(f"DIVERSITY_LOSS_WEIGHT: {DIVERSITY_LOSS_WEIGHT}")
+    print(f"DIVERSITY_SIM_CEILING: {DIVERSITY_SIM_CEILING}")
+    print(f"FEATURE_LAYERS: {FEATURE_LAYERS}")
+    print(f"FEATURE_WEIGHTS: {FEATURE_WEIGHTS}")
+    print(f"MOCO_CHECKPOINT_PATH: {MOCO_CHECKPOINT_PATH}")
+    print("=" * 80)
+
+    pbar = tqdm(total=steps, desc="Training steps")
+
+    while global_step < steps:
+        epoch_total_loss = 0.0
+        epoch_drift_loss = 0.0
+        epoch_rel_loss = 0.0
+        epoch_div_loss = 0.0
+        epoch_num_batches = 0
+
+        epoch_layer_sums = {}
+        epoch_layer_counts = {}
+
+        last_real_img = None
+
+        for real_images, _ in loader:
+            if global_step >= steps:
+                break
+
+            real_images = real_images.to(DEVICE, non_blocking=True)
+
+            z = torch.randn(gen_batch_size, in_dim, device=DEVICE)
+
+            gen_raw = model(z)
+            gen_images = flat_to_img(gen_raw)
+
+            with torch.no_grad():
+                real_features = feature_extractor(real_images)
+
+            gen_features = feature_extractor(gen_images)
+
+            drift_loss, drift_logs = drifting_feature_loss(
+                gen_features=gen_features,
+                real_features=real_features,
+                temperature=temp,
+                feature_weights=FEATURE_WEIGHTS,
+            )
+
+            relational_loss, rel_logs = batchwise_relational_loss(
+                gen_features=gen_features,
+                z=z,
+                feature_weights=FEATURE_WEIGHTS,
+            )
+
+            diversity_loss, div_logs = batchwise_diversity_ceiling_loss(
+                gen_features=gen_features,
+                feature_weights=FEATURE_WEIGHTS,
+                ceiling=DIVERSITY_SIM_CEILING,
+            )
+
+            total_loss = (
+                DRIFT_LOSS_WEIGHT * drift_loss
+                + RELATIONAL_LOSS_WEIGHT * relational_loss
+                + DIVERSITY_LOSS_WEIGHT * diversity_loss
+            )
+
+            opt.zero_grad(set_to_none=True)
+            total_loss.backward()
+            opt.step()
+
+            total_loss_val = float(total_loss.item())
+            drift_loss_val = float(drift_loss.item())
+            rel_loss_val = float(relational_loss.item())
+            div_loss_val = float(diversity_loss.item())
+
+            step_total_loss_history.append(total_loss_val)
+            step_drift_loss_history.append(drift_loss_val)
+            step_rel_loss_history.append(rel_loss_val)
+            step_div_loss_history.append(div_loss_val)
+
+            epoch_total_loss += total_loss_val
+            epoch_drift_loss += drift_loss_val
+            epoch_rel_loss += rel_loss_val
+            epoch_div_loss += div_loss_val
+            epoch_num_batches += 1
+
+            all_logs = {}
+            all_logs.update(drift_logs)
+            all_logs.update(rel_logs)
+            all_logs.update(div_logs)
+
+            for k, v in all_logs.items():
+                epoch_layer_sums[k] = epoch_layer_sums.get(k, 0.0) + float(v)
+                epoch_layer_counts[k] = epoch_layer_counts.get(k, 0) + 1
+
+            last_real_img = real_images
+
+            global_step += 1
+            pbar.update(1)
+            pbar.set_postfix(
+                total=f"{total_loss_val:.3e}",
+                drift=f"{drift_loss_val:.3e}",
+                rel=f"{rel_loss_val:.3e}",
+                div=f"{div_loss_val:.3e}",
+            )
+
+            if global_step == 1 or global_step % PLOT_EVERY == 0:
+                with torch.no_grad():
+                    vis_raw = model(fixed_z)
+                    vis_img = flat_to_img(vis_raw)
+
+                save_image_comparison(
+                    real_img=last_real_img,
+                    gen_img=vis_img,
+                    step=global_step,
+                    epoch=epoch,
+                )
+
+                save_relational_cosine_row(
+                    model=model,
+                    step=global_step,
+                    epoch=epoch,
+                    in_dim=in_dim,
+                )
+
+                save_loss_curve(
+                    step_total_loss_history=step_total_loss_history,
+                    step_drift_loss_history=step_drift_loss_history,
+                    step_rel_loss_history=step_rel_loss_history,
+                    step_div_loss_history=step_div_loss_history,
+                    epoch_total_loss_history=epoch_total_loss_history,
+                    epoch_drift_loss_history=epoch_drift_loss_history,
+                    epoch_rel_loss_history=epoch_rel_loss_history,
+                    epoch_div_loss_history=epoch_div_loss_history,
+                )
+
+            if global_step > 0 and global_step % SAVE_EVERY == 0:
+                save_checkpoint(
+                    model=model,
+                    opt=opt,
+                    step=global_step,
+                    epoch=epoch,
+                    in_dim=in_dim,
+                    hidden=hidden,
+                    temp=temp,
+                )
+
+        if epoch_num_batches > 0:
+            avg_epoch_total_loss = epoch_total_loss / epoch_num_batches
+            avg_epoch_drift_loss = epoch_drift_loss / epoch_num_batches
+            avg_epoch_rel_loss = epoch_rel_loss / epoch_num_batches
+            avg_epoch_div_loss = epoch_div_loss / epoch_num_batches
+
+            epoch_total_loss_history.append(avg_epoch_total_loss)
+            epoch_drift_loss_history.append(avg_epoch_drift_loss)
+            epoch_rel_loss_history.append(avg_epoch_rel_loss)
+            epoch_div_loss_history.append(avg_epoch_div_loss)
+
+            avg_layer_logs = {
+                k: epoch_layer_sums[k] / max(epoch_layer_counts[k], 1)
+                for k in sorted(epoch_layer_sums.keys())
+            }
+
+            layer_msg = " | ".join([
+                f"{k}: {v:.6f}"
+                for k, v in avg_layer_logs.items()
+            ])
+
+            print(
+                f"\nEpoch {epoch:04d} complete | "
+                f"steps_seen: {global_step:06d}/{steps} | "
+                f"avg_total_loss: {avg_epoch_total_loss:.8f} | "
+                f"avg_drift_loss: {avg_epoch_drift_loss:.8f} | "
+                f"avg_rel_loss: {avg_epoch_rel_loss:.8f} | "
+                f"avg_div_loss: {avg_epoch_div_loss:.8f} | "
+                f"{layer_msg}\n"
+            )
+
+            save_loss_curve(
+                step_total_loss_history=step_total_loss_history,
+                step_drift_loss_history=step_drift_loss_history,
+                step_rel_loss_history=step_rel_loss_history,
+                step_div_loss_history=step_div_loss_history,
+                epoch_total_loss_history=epoch_total_loss_history,
+                epoch_drift_loss_history=epoch_drift_loss_history,
+                epoch_rel_loss_history=epoch_rel_loss_history,
+                epoch_div_loss_history=epoch_div_loss_history,
+            )
+
+        epoch += 1
+
+    pbar.close()
+
+    save_checkpoint(
+        model=model,
+        opt=opt,
+        step=global_step,
+        epoch=epoch,
+        in_dim=in_dim,
+        hidden=hidden,
+        temp=temp,
+    )
+
+    final_path = os.path.join(CHECKPOINT_DIR, "model_final.pth")
+    torch.save(
+        {
+            "step": global_step,
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "IMAGE_SIZE": IMAGE_SIZE,
+            "IN_DIM": in_dim,
+            "HIDDEN": hidden,
+            "DRIFT_TEMPERATURE": temp,
+            "DRIFT_LOSS_WEIGHT": DRIFT_LOSS_WEIGHT,
+            "RELATIONAL_LOSS_WEIGHT": RELATIONAL_LOSS_WEIGHT,
+            "DIVERSITY_LOSS_WEIGHT": DIVERSITY_LOSS_WEIGHT,
+            "DIVERSITY_SIM_CEILING": DIVERSITY_SIM_CEILING,
+            "FEATURE_BACKBONE": "moco_v2_resnet50",
+            "FEATURE_LAYERS": FEATURE_LAYERS,
+            "FEATURE_WEIGHTS": FEATURE_WEIGHTS,
+            "MOCO_CHECKPOINT_PATH": MOCO_CHECKPOINT_PATH,
+        },
+        final_path,
+    )
+
+    save_loss_curve(
+        step_total_loss_history=step_total_loss_history,
+        step_drift_loss_history=step_drift_loss_history,
+        step_rel_loss_history=step_rel_loss_history,
+        step_div_loss_history=step_div_loss_history,
+        epoch_total_loss_history=epoch_total_loss_history,
+        epoch_drift_loss_history=epoch_drift_loss_history,
+        epoch_rel_loss_history=epoch_rel_loss_history,
+        epoch_div_loss_history=epoch_div_loss_history,
+    )
+
+    print("Training complete.")
+    print(f"Saved final checkpoint: {final_path}")
+
+    return (
+        model,
+        step_total_loss_history,
+        step_drift_loss_history,
+        step_rel_loss_history,
+        step_div_loss_history,
+        epoch_total_loss_history,
+        epoch_drift_loss_history,
+        epoch_rel_loss_history,
+        epoch_div_loss_history,
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+if __name__ == "__main__":
+    print("Training on STL-10 unlabeled images with MoCo feature-space drift + z relational + diversity loss...")
+
+    (
+        model_stl,
+        step_total_loss_stl,
+        step_drift_loss_stl,
+        step_rel_loss_stl,
+        step_div_loss_stl,
+        epoch_total_loss_stl,
+        epoch_drift_loss_stl,
+        epoch_rel_loss_stl,
+        epoch_div_loss_stl,
+    ) = train_stl_feature_drift_relational_diversity(
+        steps=STEPS,
+        data_batch_size=DATA_BATCH_SIZE,
+        gen_batch_size=GEN_BATCH_SIZE,
+        lr=LR,
+        temp=DRIFT_TEMPERATURE,
+        in_dim=IN_DIM,
+        hidden=HIDDEN,
+        seed=42,
+    )
+
+    print

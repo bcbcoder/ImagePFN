@@ -1,0 +1,896 @@
+# test_online_image_pfn_cifar10_10_binary_tasks_32d.py
+
+import random
+import statistics
+from dataclasses import dataclass
+
+import matplotlib.pyplot as plt
+import torch
+from torch.utils.data import Dataset, DataLoader, Subset
+from torchvision import transforms
+from torchvision.datasets import CIFAR10
+
+from legacy_vit import ImagePFN
+
+
+# ============================================================
+# Defaults
+# ============================================================
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+TASK_SIZE = 600
+NUM_CONTEXT = 500
+
+# Updated for new 32x32 ImagePFN setup.
+IMAGE_SIZE = 32
+
+SEED = 123
+
+NUM_SEEDS_PER_TASK = 30
+LOAD_BATCH_SIZE = 128
+
+CIFAR_ROOT = "./data"
+
+CIFAR10_CLASS_NAMES = [
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck",
+]
+
+# ------------------------------------------------------------
+# 10 binary datasets.
+#
+# Label convention for every task:
+#     class0 -> 0
+#     class1 -> 1
+# ------------------------------------------------------------
+
+BINARY_TASKS = [
+    ("airplane", "frog"),
+    ("automobile", "frog"),
+    ("ship", "deer"),
+    ("truck", "bird"),
+    ("airplane", "horse"),
+    ("automobile", "bird"),
+    ("ship", "dog"),
+    ("truck", "cat"),
+    ("frog", "ship"),
+    ("deer", "airplane"),
+]
+
+
+# ============================================================
+# Reproducibility
+# ============================================================
+
+def seed_everything(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# Model loading
+# ============================================================
+
+def get_ckpt_value(ckpt, key, default):
+    return ckpt[key] if key in ckpt else default
+
+
+def load_image_pfn_from_checkpoint(checkpoint_path, device):
+    ckpt = torch.load(checkpoint_path, map_location=device)
+
+    image_size = get_ckpt_value(ckpt, "image_size", IMAGE_SIZE)
+    patch_size = get_ckpt_value(ckpt, "patch_size", 8)
+
+    print("Checkpoint model config:")
+    print(f"  image_size: {image_size}")
+    print(f"  patch_size: {patch_size}")
+    print(f"  image_embed_dim: {get_ckpt_value(ckpt, 'image_embed_dim', 256)}")
+    print(f"  image_depth: {get_ckpt_value(ckpt, 'image_depth', 4)}")
+    print(f"  image_heads: {get_ckpt_value(ckpt, 'image_heads', 8)}")
+    print(f"  set_embed_dim: {get_ckpt_value(ckpt, 'set_embed_dim', 256)}")
+    print(f"  set_depth: {get_ckpt_value(ckpt, 'set_depth', 4)}")
+    print(f"  set_heads: {get_ckpt_value(ckpt, 'set_heads', 8)}")
+    print(f"  label_embed_dim: {get_ckpt_value(ckpt, 'label_embed_dim', 32)}")
+    print(f"  dropout: {get_ckpt_value(ckpt, 'dropout', 0.0)}")
+
+    model = ImagePFN(
+        image_size=image_size,
+        patch_size=patch_size,
+
+        image_embed_dim=get_ckpt_value(ckpt, "image_embed_dim", 256),
+        image_depth=get_ckpt_value(ckpt, "image_depth", 4),
+        image_heads=get_ckpt_value(ckpt, "image_heads", 8),
+
+        set_embed_dim=get_ckpt_value(ckpt, "set_embed_dim", 256),
+        set_depth=get_ckpt_value(ckpt, "set_depth", 4),
+        set_heads=get_ckpt_value(ckpt, "set_heads", 8),
+
+        label_embed_dim=get_ckpt_value(ckpt, "label_embed_dim", 32),
+        dropout=get_ckpt_value(ckpt, "dropout", 0.0),
+        num_classes=2,
+    ).to(device)
+
+    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    model.eval()
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    return model, ckpt
+
+
+def extract_query_logits(outputs):
+    if isinstance(outputs, dict):
+        if "query_logits" in outputs:
+            return outputs["query_logits"]
+        if "logits" in outputs:
+            return outputs["logits"]
+        raise KeyError(f"Could not find logits. Output keys: {list(outputs.keys())}")
+
+    if torch.is_tensor(outputs):
+        return outputs
+
+    raise TypeError(f"Unsupported model output type: {type(outputs)}")
+
+
+# ============================================================
+# CIFAR-10 binary dataset
+# ============================================================
+
+@dataclass
+class BinaryTaskSpec:
+    task_name: str
+    class0_name: str
+    class1_name: str
+    class0_cifar_idx: int
+    class1_cifar_idx: int
+
+
+def make_binary_task_spec(class0_name, class1_name):
+    if class0_name not in CIFAR10_CLASS_NAMES:
+        raise ValueError(f"Unknown CIFAR-10 class0_name: {class0_name}")
+
+    if class1_name not in CIFAR10_CLASS_NAMES:
+        raise ValueError(f"Unknown CIFAR-10 class1_name: {class1_name}")
+
+    class0_idx = CIFAR10_CLASS_NAMES.index(class0_name)
+    class1_idx = CIFAR10_CLASS_NAMES.index(class1_name)
+
+    task_name = f"{class0_name}_vs_{class1_name}"
+
+    return BinaryTaskSpec(
+        task_name=task_name,
+        class0_name=class0_name,
+        class1_name=class1_name,
+        class0_cifar_idx=class0_idx,
+        class1_cifar_idx=class1_idx,
+    )
+
+
+class CIFAR10BinaryDataset(Dataset):
+    """
+    Binary CIFAR-10 subset.
+
+    For a given task:
+        class0_name -> label 0
+        class1_name -> label 1
+
+    Uses both CIFAR train and test when wrapped by CombinedCIFAR10BinaryDataset.
+    """
+
+    def __init__(
+        self,
+        cifar_dataset,
+        task_spec,
+        image_size=32,
+        split_name="unknown",
+    ):
+        self.cifar = cifar_dataset
+        self.task_spec = task_spec
+        self.split_name = split_name
+
+        self.samples = []
+
+        for idx in range(len(self.cifar)):
+            _img, target = self.cifar[idx]
+
+            if target == task_spec.class0_cifar_idx:
+                self.samples.append(
+                    {
+                        "idx": idx,
+                        "label": 0,
+                        "class_name": task_spec.class0_name,
+                        "cifar_target": target,
+                        "split": split_name,
+                    }
+                )
+
+            elif target == task_spec.class1_cifar_idx:
+                self.samples.append(
+                    {
+                        "idx": idx,
+                        "label": 1,
+                        "class_name": task_spec.class1_name,
+                        "cifar_target": target,
+                        "split": split_name,
+                    }
+                )
+
+        self.transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+        ])
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        item = self.samples[idx]
+
+        pil_img, _target = self.cifar[item["idx"]]
+        img = self.transform(pil_img)
+
+        label = torch.tensor(item["label"], dtype=torch.long)
+
+        return img, label
+
+    def get_sample_info(self, idx):
+        return self.samples[idx]
+
+
+class CombinedCIFAR10BinaryDataset(Dataset):
+    """
+    Combines train and test CIFAR-10 binary subsets while preserving get_sample_info().
+    """
+
+    def __init__(self, datasets):
+        self.datasets = list(datasets)
+
+        self.cumulative_sizes = []
+        total = 0
+
+        for dataset in self.datasets:
+            total += len(dataset)
+            self.cumulative_sizes.append(total)
+
+        if total == 0:
+            raise ValueError("Combined dataset has zero samples.")
+
+    def __len__(self):
+        return self.cumulative_sizes[-1]
+
+    def _resolve_index(self, idx):
+        dataset_idx = 0
+
+        while idx >= self.cumulative_sizes[dataset_idx]:
+            dataset_idx += 1
+
+        previous_total = 0 if dataset_idx == 0 else self.cumulative_sizes[dataset_idx - 1]
+        local_idx = idx - previous_total
+
+        return dataset_idx, local_idx
+
+    def __getitem__(self, idx):
+        dataset_idx, local_idx = self._resolve_index(idx)
+        return self.datasets[dataset_idx][local_idx]
+
+    def get_sample_info(self, idx):
+        dataset_idx, local_idx = self._resolve_index(idx)
+        return self.datasets[dataset_idx].get_sample_info(local_idx)
+
+
+def load_cifar10_base(root=CIFAR_ROOT):
+    train_base = CIFAR10(
+        root=root,
+        train=True,
+        download=True,
+    )
+
+    test_base = CIFAR10(
+        root=root,
+        train=False,
+        download=True,
+    )
+
+    return train_base, test_base
+
+
+def make_binary_dataset_from_cifar(
+    train_base,
+    test_base,
+    task_spec,
+    image_size,
+):
+    train_binary = CIFAR10BinaryDataset(
+        cifar_dataset=train_base,
+        task_spec=task_spec,
+        image_size=image_size,
+        split_name="train",
+    )
+
+    test_binary = CIFAR10BinaryDataset(
+        cifar_dataset=test_base,
+        task_spec=task_spec,
+        image_size=image_size,
+        split_name="test",
+    )
+
+    dataset = CombinedCIFAR10BinaryDataset(
+        datasets=[train_binary, test_binary],
+    )
+
+    return dataset
+
+
+# ============================================================
+# Preview grid
+# ============================================================
+
+def save_preview_grid(
+    dataset,
+    task_spec,
+    save_path,
+):
+    """
+    Saves a quick visual check:
+
+        top row: 5 class0 examples, label 0
+        bottom row: 5 class1 examples, label 1
+    """
+    class0_indices = []
+    class1_indices = []
+
+    for idx in range(len(dataset)):
+        info = dataset.get_sample_info(idx)
+
+        if info["label"] == 0 and len(class0_indices) < 5:
+            class0_indices.append(idx)
+
+        elif info["label"] == 1 and len(class1_indices) < 5:
+            class1_indices.append(idx)
+
+        if len(class0_indices) >= 5 and len(class1_indices) >= 5:
+            break
+
+    if len(class0_indices) < 5 or len(class1_indices) < 5:
+        raise ValueError(
+            f"Could not find 5 examples of each class. "
+            f"{task_spec.class0_name}={len(class0_indices)}, "
+            f"{task_spec.class1_name}={len(class1_indices)}"
+        )
+
+    print("Preview examples selected:")
+
+    print(f"  {task_spec.class0_name} / label 0:")
+    for idx in class0_indices:
+        info = dataset.get_sample_info(idx)
+        print(
+            f"    idx={idx} | label={info['label']} | "
+            f"class={info['class_name']} | split={info['split']}"
+        )
+
+    print(f"  {task_spec.class1_name} / label 1:")
+    for idx in class1_indices:
+        info = dataset.get_sample_info(idx)
+        print(
+            f"    idx={idx} | label={info['label']} | "
+            f"class={info['class_name']} | split={info['split']}"
+        )
+
+    preview_indices = class0_indices + class1_indices
+
+    fig, axes = plt.subplots(2, 5, figsize=(10, 4))
+
+    for plot_idx, dataset_idx in enumerate(preview_indices):
+        img, label = dataset[dataset_idx]
+        info = dataset.get_sample_info(dataset_idx)
+
+        row = plot_idx // 5
+        col = plot_idx % 5
+
+        img_np = img.permute(1, 2, 0).detach().cpu().numpy()
+
+        axes[row, col].imshow(img_np)
+        axes[row, col].axis("off")
+        axes[row, col].set_title(
+            f"{info['class_name']} / {int(label.item())}",
+            fontsize=9,
+        )
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved preview grid: {save_path}")
+
+
+# ============================================================
+# Balanced task sampling
+# ============================================================
+
+def get_class_indices(dataset):
+    class0_indices = []
+    class1_indices = []
+
+    for idx in range(len(dataset)):
+        label = int(dataset.get_sample_info(idx)["label"])
+
+        if label == 0:
+            class0_indices.append(idx)
+        elif label == 1:
+            class1_indices.append(idx)
+
+    return class0_indices, class1_indices
+
+
+def sample_balanced_task_indices(dataset, task_size, seed, task_spec):
+    """
+    Samples a balanced binary task:
+
+        task_size / 2 class0
+        task_size / 2 class1
+
+    Then shuffles the mixed task.
+    """
+    if task_size % 2 != 0:
+        raise ValueError("task_size must be even for balanced binary sampling.")
+
+    rng = random.Random(seed)
+
+    class0_indices, class1_indices = get_class_indices(dataset)
+
+    per_class = task_size // 2
+
+    if len(class0_indices) < per_class:
+        raise ValueError(
+            f"Need {per_class} {task_spec.class0_name} images, "
+            f"found {len(class0_indices)}."
+        )
+
+    if len(class1_indices) < per_class:
+        raise ValueError(
+            f"Need {per_class} {task_spec.class1_name} images, "
+            f"found {len(class1_indices)}."
+        )
+
+    chosen = (
+        rng.sample(class0_indices, per_class)
+        + rng.sample(class1_indices, per_class)
+    )
+
+    rng.shuffle(chosen)
+
+    return chosen
+
+
+def load_indices_as_tensors(dataset, indices, batch_size, device):
+    subset = Subset(dataset, indices)
+
+    loader = DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+    images_list = []
+    labels_list = []
+
+    for images, labels in loader:
+        images_list.append(images)
+        labels_list.append(labels)
+
+    images = torch.cat(images_list, dim=0).to(device)
+    labels = torch.cat(labels_list, dim=0).long().to(device)
+
+    return images, labels
+
+
+# ============================================================
+# Evaluation
+# ============================================================
+
+@torch.no_grad()
+def evaluate_single_task(model, images, labels, num_context, device):
+    """
+    One ImagePFN online task.
+
+    context:
+        images[:num_context], labels[:num_context]
+
+    query:
+        images[num_context:], labels[num_context:]
+    """
+    context_images = images[:num_context].unsqueeze(0).to(device)
+    context_labels = labels[:num_context].unsqueeze(0).long().to(device)
+
+    query_images = images[num_context:].unsqueeze(0).to(device)
+    query_labels = labels[num_context:].long().to(device)
+
+    outputs = model(
+        context_images=context_images,
+        context_labels=context_labels,
+        query_images=query_images,
+    )
+
+    logits = extract_query_logits(outputs)
+
+    if logits.dim() == 3:
+        logits = logits.squeeze(0)
+
+    probs = torch.softmax(logits, dim=-1)
+    preds = probs.argmax(dim=-1)
+
+    acc = (preds == query_labels).float().mean().item()
+    correct = int((preds == query_labels).sum().item())
+    total = int(query_labels.numel())
+
+    return {
+        "query_acc": acc,
+        "correct": correct,
+        "total": total,
+        "preds": preds.detach().cpu(),
+        "query_labels": query_labels.detach().cpu(),
+        "probs": probs.detach().cpu(),
+    }
+
+
+def majority_baseline(context_labels, query_labels):
+    context_zeros = int((context_labels == 0).sum().item())
+    context_ones = int((context_labels == 1).sum().item())
+
+    majority_label = 1 if context_ones >= context_zeros else 0
+
+    preds = torch.full_like(query_labels, fill_value=majority_label)
+    acc = (preds == query_labels).float().mean().item()
+
+    return acc, majority_label, context_zeros, context_ones
+
+
+def run_one_seed(
+    model,
+    dataset,
+    task_spec,
+    task_size,
+    num_context,
+    seed,
+    load_batch_size,
+    device,
+):
+    task_indices = sample_balanced_task_indices(
+        dataset=dataset,
+        task_size=task_size,
+        seed=seed,
+        task_spec=task_spec,
+    )
+
+    images, labels = load_indices_as_tensors(
+        dataset=dataset,
+        indices=task_indices,
+        batch_size=load_batch_size,
+        device=device,
+    )
+
+    context_labels = labels[:num_context]
+    query_labels = labels[num_context:]
+
+    base_acc, majority_label, _, _ = majority_baseline(
+        context_labels=context_labels,
+        query_labels=query_labels,
+    )
+
+    results = evaluate_single_task(
+        model=model,
+        images=images,
+        labels=labels,
+        num_context=num_context,
+        device=device,
+    )
+
+    return {
+        "seed": seed,
+        "query_acc": float(results["query_acc"]),
+        "correct": int(results["correct"]),
+        "total": int(results["total"]),
+        "majority_baseline_acc": float(base_acc),
+        "improvement_vs_majority": float(results["query_acc"] - base_acc),
+        "majority_label": int(majority_label),
+
+        "task_class0": int((labels == 0).sum().item()),
+        "task_class1": int((labels == 1).sum().item()),
+
+        "context_class0": int((context_labels == 0).sum().item()),
+        "context_class1": int((context_labels == 1).sum().item()),
+
+        "query_class0": int((query_labels == 0).sum().item()),
+        "query_class1": int((query_labels == 1).sum().item()),
+    }
+
+
+def summarize_results(task_spec, all_results):
+    accs = [r["query_acc"] for r in all_results]
+    baselines = [r["majority_baseline_acc"] for r in all_results]
+    improvements = [r["improvement_vs_majority"] for r in all_results]
+
+    mean_acc = statistics.mean(accs)
+    std_acc = statistics.stdev(accs) if len(accs) > 1 else 0.0
+
+    mean_baseline = statistics.mean(baselines)
+    std_baseline = statistics.stdev(baselines) if len(baselines) > 1 else 0.0
+
+    mean_improvement = statistics.mean(improvements)
+    std_improvement = statistics.stdev(improvements) if len(improvements) > 1 else 0.0
+
+    total_correct = sum(r["correct"] for r in all_results)
+    total_query = sum(r["total"] for r in all_results)
+    pooled_acc = total_correct / max(total_query, 1)
+
+    summary = {
+        "task_name": task_spec.task_name,
+        "class0_name": task_spec.class0_name,
+        "class1_name": task_spec.class1_name,
+
+        "mean_query_acc": mean_acc,
+        "std_query_acc": std_acc,
+        "min_query_acc": min(accs),
+        "max_query_acc": max(accs),
+        "pooled_query_acc": pooled_acc,
+        "total_correct": total_correct,
+        "total_query": total_query,
+
+        "mean_majority_baseline_acc": mean_baseline,
+        "std_majority_baseline_acc": std_baseline,
+
+        "mean_improvement": mean_improvement,
+        "std_improvement": std_improvement,
+    }
+
+    return summary
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main(
+    model_checkpoint,
+    binary_tasks=BINARY_TASKS,
+    task_size=TASK_SIZE,
+    num_context=NUM_CONTEXT,
+    base_seed=SEED,
+    num_seeds_per_task=NUM_SEEDS_PER_TASK,
+    load_batch_size=LOAD_BATCH_SIZE,
+    image_size=IMAGE_SIZE,
+):
+    seed_everything(base_seed)
+
+    if num_context >= task_size:
+        raise ValueError("num_context must be smaller than task_size.")
+
+    print("=" * 110)
+    print("Online ImagePFN CIFAR-10 binary task evaluation")
+    print("=" * 110)
+    print(f"DEVICE: {DEVICE}")
+    print(f"Model checkpoint: {model_checkpoint}")
+    print(f"TASK_SIZE: {task_size}")
+    print(f"NUM_CONTEXT: {num_context}")
+    print(f"NUM_QUERY: {task_size - num_context}")
+    print(f"NUM_SEEDS_PER_TASK: {num_seeds_per_task}")
+    print(f"BASE_SEED: {base_seed}")
+    print(f"DEFAULT IMAGE_SIZE: {image_size}")
+    print(f"Number of binary tasks: {len(binary_tasks)}")
+    print("=" * 110)
+
+    # --------------------------------------------------------
+    # 1. Load ImagePFN once
+    # --------------------------------------------------------
+
+    model, ckpt = load_image_pfn_from_checkpoint(
+        checkpoint_path=model_checkpoint,
+        device=DEVICE,
+    )
+
+    ckpt_image_size = get_ckpt_value(ckpt, "image_size", image_size)
+
+    print("Loaded ImagePFN.")
+    print(f"Checkpoint epoch: {ckpt.get('epoch', 'unknown')}")
+    print(f"Checkpoint global_step: {ckpt.get('global_step', 'unknown')}")
+    print(f"Image size used for resize: {ckpt_image_size}")
+
+    if int(ckpt_image_size) != 32:
+        print(
+            "[Warning] This checkpoint does not report image_size=32. "
+            f"It reports image_size={ckpt_image_size}. CIFAR images will be resized "
+            "to the checkpoint size so the model input shape matches."
+        )
+
+    # --------------------------------------------------------
+    # 2. Load CIFAR-10 once
+    # --------------------------------------------------------
+
+    train_base, test_base = load_cifar10_base(root=CIFAR_ROOT)
+
+    print("Loaded CIFAR-10 base datasets.")
+    print(f"Train size: {len(train_base)}")
+    print(f"Test size:  {len(test_base)}")
+
+    # --------------------------------------------------------
+    # 3. Run all binary tasks
+    # --------------------------------------------------------
+
+    all_task_summaries = []
+
+    for task_idx, (class0_name, class1_name) in enumerate(binary_tasks):
+        task_spec = make_binary_task_spec(
+            class0_name=class0_name,
+            class1_name=class1_name,
+        )
+
+        print("\n" + "#" * 110)
+        print(
+            f"Binary task {task_idx + 1}/{len(binary_tasks)}: "
+            f"{task_spec.class0_name}=0 vs {task_spec.class1_name}=1"
+        )
+        print("#" * 110)
+
+        dataset = make_binary_dataset_from_cifar(
+            train_base=train_base,
+            test_base=test_base,
+            task_spec=task_spec,
+            image_size=ckpt_image_size,
+        )
+
+        class0_indices, class1_indices = get_class_indices(dataset)
+
+        print(f"Total binary dataset images: {len(dataset)}")
+        print(f"Available {task_spec.class0_name}/0: {len(class0_indices)}")
+        print(f"Available {task_spec.class1_name}/1: {len(class1_indices)}")
+        print(f"Required per class for balanced task: {task_size // 2}")
+
+        preview_path = f"cifar10_{task_spec.task_name}_preview_5_each_32.png"
+
+        save_preview_grid(
+            dataset=dataset,
+            task_spec=task_spec,
+            save_path=preview_path,
+        )
+
+        task_results = []
+
+        print(f"\nRunning repeated balanced {task_size}-sample tasks:")
+        print(
+            f"Each seed samples {task_size // 2} {task_spec.class0_name} "
+            f"+ {task_size // 2} {task_spec.class1_name}, then mixes them."
+        )
+        print("-" * 110)
+
+        for seed_offset in range(num_seeds_per_task):
+            seed = base_seed + seed_offset
+
+            result = run_one_seed(
+                model=model,
+                dataset=dataset,
+                task_spec=task_spec,
+                task_size=task_size,
+                num_context=num_context,
+                seed=seed,
+                load_batch_size=load_batch_size,
+                device=DEVICE,
+            )
+
+            task_results.append(result)
+
+            print(
+                f"task {task_spec.task_name} | "
+                f"seed {seed:04d} | "
+                f"acc {result['query_acc']:.4f} "
+                f"({result['correct']}/{result['total']}) | "
+                f"baseline {result['majority_baseline_acc']:.4f} | "
+                f"improve {result['improvement_vs_majority']:+.4f} | "
+                f"query {task_spec.class0_name}/{task_spec.class1_name} "
+                f"{result['query_class0']}/{result['query_class1']} | "
+                f"context {task_spec.class0_name}/{task_spec.class1_name} "
+                f"{result['context_class0']}/{result['context_class1']}"
+            )
+
+        summary = summarize_results(
+            task_spec=task_spec,
+            all_results=task_results,
+        )
+
+        all_task_summaries.append(summary)
+
+        print("\n" + "=" * 110)
+        print(f"{num_seeds_per_task}-seed summary: {task_spec.task_name}")
+        print("=" * 110)
+        print(f"mean_query_acc:              {summary['mean_query_acc']:.4f}")
+        print(f"std_query_acc:               {summary['std_query_acc']:.4f}")
+        print(f"min_query_acc:               {summary['min_query_acc']:.4f}")
+        print(f"max_query_acc:               {summary['max_query_acc']:.4f}")
+        print(
+            f"pooled_query_acc:            {summary['pooled_query_acc']:.4f} "
+            f"({summary['total_correct']}/{summary['total_query']})"
+        )
+        print(f"mean_majority_baseline_acc:  {summary['mean_majority_baseline_acc']:.4f}")
+        print(f"std_majority_baseline_acc:   {summary['std_majority_baseline_acc']:.4f}")
+        print(f"mean_improvement:            {summary['mean_improvement']:+.4f}")
+        print(f"std_improvement:             {summary['std_improvement']:.4f}")
+
+    # --------------------------------------------------------
+    # 4. Overall summary
+    # --------------------------------------------------------
+
+    print("\n" + "#" * 110)
+    print("OVERALL SUMMARY ACROSS ALL BINARY TASKS")
+    print("#" * 110)
+
+    for summary in all_task_summaries:
+        print(
+            f"{summary['task_name']:24s} | "
+            f"mean_acc {summary['mean_query_acc']:.4f} | "
+            f"baseline {summary['mean_majority_baseline_acc']:.4f} | "
+            f"improve {summary['mean_improvement']:+.4f} | "
+            f"pooled {summary['pooled_query_acc']:.4f}"
+        )
+
+    mean_task_acc = statistics.mean(
+        [s["mean_query_acc"] for s in all_task_summaries]
+    )
+
+    mean_task_baseline = statistics.mean(
+        [s["mean_majority_baseline_acc"] for s in all_task_summaries]
+    )
+
+    mean_task_improvement = statistics.mean(
+        [s["mean_improvement"] for s in all_task_summaries]
+    )
+
+    total_correct_all = sum(s["total_correct"] for s in all_task_summaries)
+    total_query_all = sum(s["total_query"] for s in all_task_summaries)
+    pooled_acc_all = total_correct_all / max(total_query_all, 1)
+
+    print("\nAggregate:")
+    print(f"mean_of_task_mean_acc:          {mean_task_acc:.4f}")
+    print(f"mean_of_task_baseline_acc:      {mean_task_baseline:.4f}")
+    print(f"mean_of_task_improvement:       {mean_task_improvement:+.4f}")
+    print(f"pooled_acc_all_tasks:           {pooled_acc_all:.4f} ({total_correct_all}/{total_query_all})")
+
+    print("\nInterpretation:")
+    print(
+        "If mean_query_acc is above the majority baseline across many binary tasks, "
+        "the ImagePFN is using the context images/labels rather than only class imbalance."
+    )
+    print(
+        "This 32D setup resizes CIFAR-10 images to the checkpoint image size, "
+        "normally 32x32 for the new MoCo/simple MLP ImagePFN run."
+    )
+
+
+if __name__ == "__main__":
+    # Update this to the 32D ImagePFN checkpoint you want to test.
+    MODEL_CHECKPOINT = (
+        "image_pfn_checkpoints_32d_moco_mlp/"
+        "image_pfn_epoch_201_step_001407.pth"
+    )
+
+    main(
+        model_checkpoint=MODEL_CHECKPOINT,
+        binary_tasks=BINARY_TASKS,
+        task_size=600,
+        num_context=500,
+        base_seed=123,
+        num_seeds_per_task=30,
+        load_batch_size=128,
+        image_size=32,
+    )

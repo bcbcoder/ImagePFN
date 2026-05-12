@@ -1,0 +1,700 @@
+
+import torch
+import torch.nn as nn
+
+
+# ============================================================
+# Optional branch-scale 
+# ============================================================
+
+FEATURE_FAMILIES = [
+    "hog",
+    "resnet18",
+    "gabor",
+    "dog",
+    "fft",
+    "steerable",
+    "vgg16_early",
+    "mobilenet_v3_small",
+    "color_hsv",
+    "soft_lbp",
+    "shape_edges",
+    "soft_contour",
+    "curvature_hessian",
+]
+
+SCALES = [32, 16]
+
+DEFAULT_IMAGE_SIZE = 32
+DEFAULT_HIDDEN = 256
+
+# Fallback chunk dim only used if the checkpoint does not store chunk metadata.
+DEFAULT_DIMS_PER_SUBVECTOR = 12
+
+VECTOR_NORM_EPS = 1e-6
+NEAR_ZERO_VECTOR_NORM = 0.05
+
+
+# ============================================================
+# MLP generator architecture
+# ============================================================
+
+class MLP(nn.Module):
+    """
+    Generic MLP generator:
+
+        vector -> hidden -> hidden -> hidden -> flattened image
+
+    This matches your simple z-only MLP and your branch-scale MLP as long as:
+        - IN_DIM matches the checkpoint
+        - HIDDEN matches the checkpoint
+        - IMAGE_SIZE matches the checkpoint
+    """
+
+    def __init__(self, in_dim, hidden, image_size):
+        super().__init__()
+
+        self.in_dim = int(in_dim)
+        self.hidden = int(hidden)
+        self.image_size = int(image_size)
+
+        out_dim = 3 * self.image_size * self.image_size
+
+        self.net = nn.Sequential(
+            nn.Linear(self.in_dim, self.hidden), nn.SiLU(),
+            nn.Linear(self.hidden, self.hidden), nn.SiLU(),
+            nn.Linear(self.hidden, self.hidden), nn.SiLU(),
+            nn.Linear(self.hidden, out_dim),
+        )
+
+    def forward(self, z):
+        x_flat = self.net(z)
+        x_img = x_flat.view(x_flat.shape[0], 3, self.image_size, self.image_size)
+        return torch.tanh(x_img)
+
+
+# ============================================================
+# Checkpoint loading
+# ============================================================
+
+def _get_checkpoint_model_state_dict(ckpt):
+    """
+    Supports your MLP checkpoint formats:
+
+        ckpt["model"]
+        ckpt["model_state_dict"]
+
+    Rejects old StyleGAN-oriented checkpoints by default because those use a
+    different generator architecture.
+    """
+
+    if "model" in ckpt:
+        return ckpt["model"]
+
+    if "model_state_dict" in ckpt:
+        return ckpt["model_state_dict"]
+
+    if "generator_state_dict" in ckpt:
+        raise KeyError(
+            "This checkpoint appears to be from the old StyleGAN-oriented generator "
+            "because it has key 'generator_state_dict'. This streamer is for the "
+            "MLP generator checkpoint with key 'model' or 'model_state_dict'."
+        )
+
+    raise KeyError(
+        "Could not find model weights. Expected key 'model' or 'model_state_dict'."
+    )
+
+
+def _infer_in_dim_from_state_dict(model_state):
+    """
+    Fallback if checkpoint does not contain IN_DIM.
+
+    For your MLP, the first Linear layer is usually:
+        net.0.weight with shape [hidden, in_dim]
+    """
+
+    possible_keys = [
+        "net.0.weight",
+        "module.net.0.weight",
+    ]
+
+    for k in possible_keys:
+        if k in model_state:
+            return int(model_state[k].shape[1])
+
+    for k, v in model_state.items():
+        if k.endswith("net.0.weight") and hasattr(v, "shape") and len(v.shape) == 2:
+            return int(v.shape[1])
+
+    raise KeyError(
+        "Could not infer IN_DIM from checkpoint. Expected checkpoint['IN_DIM'] "
+        "or a first-layer key like 'net.0.weight'."
+    )
+
+
+def _infer_hidden_from_state_dict(model_state):
+    """
+    Fallback if checkpoint does not contain HIDDEN.
+
+    For your MLP, the first Linear layer is usually:
+        net.0.weight with shape [hidden, in_dim]
+    """
+
+    possible_keys = [
+        "net.0.weight",
+        "module.net.0.weight",
+    ]
+
+    for k in possible_keys:
+        if k in model_state:
+            return int(model_state[k].shape[0])
+
+    for k, v in model_state.items():
+        if k.endswith("net.0.weight") and hasattr(v, "shape") and len(v.shape) == 2:
+            return int(v.shape[0])
+
+    return DEFAULT_HIDDEN
+
+
+def load_generator(checkpoint_path, device):
+    """
+    Loads an MLP generator checkpoint.
+
+    Expected useful checkpoint keys:
+        - model
+        - IN_DIM
+        - HIDDEN
+        - IMAGE_SIZE
+
+    This works for:
+        - simple z-only MLP checkpoints
+        - 13-branch / 2-scale MLP checkpoints
+        - versions trained with or without diversity loss
+        - versions trained with ResNet or MoCo feature losses
+    """
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model_state = _get_checkpoint_model_state_dict(ckpt)
+
+    in_dim = int(ckpt.get("IN_DIM", _infer_in_dim_from_state_dict(model_state)))
+    hidden = int(ckpt.get("HIDDEN", _infer_hidden_from_state_dict(model_state)))
+    image_size = int(ckpt.get("IMAGE_SIZE", DEFAULT_IMAGE_SIZE))
+
+    generator = MLP(
+        in_dim=in_dim,
+        hidden=hidden,
+        image_size=image_size,
+    ).to(device)
+
+    generator.load_state_dict(model_state, strict=True)
+    generator.eval()
+
+    for p in generator.parameters():
+        p.requires_grad = False
+
+    return generator, ckpt
+
+
+# ============================================================
+# Layout inference
+# ============================================================
+
+def infer_optional_branchscale_layout(ckpt, vector_dim):
+    """
+    Tries to infer branch-scale layout.
+
+    Returns a dictionary with:
+        has_branchscale_layout: bool
+        feature_families
+        scales
+        num_feature_branches
+        num_scales
+        dims_per_subvector
+        num_subvectors
+        expected_vector_dim
+
+    Important:
+        For simple z-only checkpoints like IN_DIM=32, this will usually return
+        has_branchscale_layout=False.
+
+    """
+
+    feature_families = ckpt.get("FEATURE_FAMILIES", None)
+    if feature_families is None:
+        feature_families = ckpt.get("feature_families", None)
+
+    scales = ckpt.get("SCALES", None)
+    if scales is None:
+        scales = ckpt.get("scales", None)
+
+    # Try several common names for chunk dimension.
+    dims_per_subvector = None
+
+    for key in [
+        "CHUNK_DIM",
+        "chunk_dim",
+        "DIMS_PER_VECTOR",
+        "dims_per_vector",
+        "DIMS_PER_SUBVECTOR",
+        "dims_per_subvector",
+    ]:
+        if key in ckpt:
+            dims_per_subvector = int(ckpt[key])
+            break
+
+    # If explicit metadata exists, use it.
+    if feature_families is not None and scales is not None and dims_per_subvector is not None:
+        num_feature_branches = len(feature_families)
+        num_scales = len(scales)
+        expected_vector_dim = num_feature_branches * num_scales * dims_per_subvector
+
+        has_layout = expected_vector_dim == int(vector_dim)
+
+        return {
+            "has_branchscale_layout": bool(has_layout),
+            "feature_families": list(feature_families),
+            "scales": list(scales),
+            "num_feature_branches": int(num_feature_branches),
+            "num_scales": int(num_scales),
+            "dims_per_subvector": int(dims_per_subvector),
+            "num_subvectors": int(vector_dim // dims_per_subvector) if vector_dim % dims_per_subvector == 0 else None,
+            "expected_vector_dim": int(expected_vector_dim),
+        }
+
+    # Fallback: try the known 13-family / 2-scale layout.
+    fallback_feature_families = FEATURE_FAMILIES
+    fallback_scales = SCALES
+
+    # If checkpoint gives chunk dim, use it. Otherwise use default.
+    if dims_per_subvector is None:
+        dims_per_subvector = DEFAULT_DIMS_PER_SUBVECTOR
+
+    fallback_expected_dim = (
+        len(fallback_feature_families)
+        * len(fallback_scales)
+        * int(dims_per_subvector)
+    )
+
+    if fallback_expected_dim == int(vector_dim):
+        return {
+            "has_branchscale_layout": True,
+            "feature_families": list(fallback_feature_families),
+            "scales": list(fallback_scales),
+            "num_feature_branches": len(fallback_feature_families),
+            "num_scales": len(fallback_scales),
+            "dims_per_subvector": int(dims_per_subvector),
+            "num_subvectors": int(vector_dim // dims_per_subvector),
+            "expected_vector_dim": int(fallback_expected_dim),
+        }
+
+    # No branch-scale layout detected.
+    return {
+        "has_branchscale_layout": False,
+        "feature_families": None,
+        "scales": None,
+        "num_feature_branches": None,
+        "num_scales": None,
+        "dims_per_subvector": None,
+        "num_subvectors": None,
+        "expected_vector_dim": None,
+    }
+
+
+# ============================================================
+# Vector sampling
+# ============================================================
+
+def safe_normalize_vector(y, eps=VECTOR_NORM_EPS):
+    """
+    Safely normalizes vectors.
+
+    Used only for near-zero replacement in isolated chunk mode.
+    """
+
+    norm = y.norm(dim=1, keepdim=True)
+
+    fallback = torch.zeros_like(y)
+    fallback[:, 0:1] = 1.0
+
+    return torch.where(
+        norm > eps,
+        y / norm.clamp_min(eps),
+        fallback,
+    )
+
+
+def sample_gaussian_vectors(
+    batch_size,
+    vector_dim,
+    device,
+    generator=None,
+):
+    """
+    Samples full Gaussian vectors.
+
+    This is the normal/default mode.
+
+    It matches your simple z-only MLP training style:
+
+        z = torch.randn(batch_size, IN_DIM)
+
+    and also works for branch-scale MLP generation when you want all chunks active.
+    """
+
+    return torch.randn(
+        batch_size,
+        vector_dim,
+        device=device,
+        generator=generator,
+    )
+
+
+def sample_gaussian_subvectors(
+    batch_size,
+    dims_per_subvector,
+    device,
+    generator=None,
+):
+    """
+    Samples one Gaussian branch/scale chunk.
+
+    Used only in single_active_chunk mode.
+    """
+
+    chunks = torch.randn(
+        batch_size,
+        dims_per_subvector,
+        device=device,
+        generator=generator,
+    )
+
+    near_zero = chunks.norm(dim=1) < NEAR_ZERO_VECTOR_NORM
+
+    if near_zero.any():
+        n = int(near_zero.sum().item())
+
+        replacement = torch.randn(
+            n,
+            dims_per_subvector,
+            device=device,
+            generator=generator,
+        )
+        replacement = safe_normalize_vector(replacement)
+
+        chunks[near_zero] = replacement
+
+    return chunks
+
+
+def sample_single_active_chunk_vectors(
+    batch_size,
+    vector_dim,
+    num_subvectors,
+    dims_per_subvector,
+    device,
+    generator=None,
+):
+    """
+    Samples full vectors with exactly one active chunk.
+
+    Only valid when a branch-scale/chunk layout exists.
+    """
+
+    vectors = torch.zeros(
+        batch_size,
+        vector_dim,
+        device=device,
+    )
+
+    active_chunk_indices = torch.randint(
+        low=0,
+        high=num_subvectors,
+        size=(batch_size,),
+        device=device,
+        generator=generator,
+    )
+
+    active_subvectors = sample_gaussian_subvectors(
+        batch_size=batch_size,
+        dims_per_subvector=dims_per_subvector,
+        device=device,
+        generator=generator,
+    )
+
+    starts = active_chunk_indices * dims_per_subvector
+    offsets = torch.arange(dims_per_subvector, device=device).view(1, -1)
+
+    cols = starts.view(-1, 1) + offsets
+    rows = torch.arange(batch_size, device=device).view(-1, 1)
+
+    vectors[rows, cols] = active_subvectors
+
+    all_subvectors = vectors.view(batch_size, num_subvectors, dims_per_subvector)
+
+    return vectors, active_chunk_indices, active_subvectors, all_subvectors
+
+
+# ============================================================
+# Streaming synthetic bank
+# ============================================================
+
+class SyntheticBankStreamer:
+    """
+    Generates image-vector batches on demand.
+
+    Nothing large is saved.
+
+    With the same:
+      - checkpoint
+      - seed
+      - total_images
+      - batch_size
+      - vector_mode
+      - call order
+
+    it regenerates the same synthetic stream.
+
+    vector_mode options:
+
+        "full":
+            Sample full Gaussian vectors [B, IN_DIM].
+            Correct default for normal generation.
+
+        "single_active_chunk":
+            Sample vectors with one active chunk and all other chunks zero.
+            Only valid for branch-scale/checkpoint layouts.
+
+        "auto":
+            Uses "single_active_chunk" if zero_other_branch_scales=True,
+            otherwise uses "full".
+
+    Backward-compatible argument:
+
+        zero_other_branch_scales:
+            Old toggle. If vector_mode="auto", this decides the mode.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path,
+        total_images=100_000,
+        batch_size=64,
+        seed=123,
+        device=None,
+
+        # New preferred mode.
+        vector_mode="full",
+
+        # Backward compatibility with old code.
+        zero_other_branch_scales=None,
+
+        # Optional chunk overrides for unusual branch-scale checkpoints.
+        dims_per_subvector=None,
+        num_subvectors=None,
+    ):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.generator, self.ckpt = load_generator(checkpoint_path, self.device)
+
+        self.checkpoint_path = checkpoint_path
+        self.total_images = int(total_images)
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+
+        self.vector_dim = int(self.ckpt.get("IN_DIM", self.generator.in_dim))
+        self.image_size = int(self.ckpt.get("IMAGE_SIZE", self.generator.image_size))
+        self.hidden = int(self.ckpt.get("HIDDEN", self.generator.hidden))
+
+        # Backward compatibility:
+        # if user passes zero_other_branch_scales=True and leaves vector_mode auto,
+        # use the old isolated-chunk behavior.
+        if zero_other_branch_scales is None:
+            zero_other_branch_scales = False
+
+        if vector_mode == "auto":
+            vector_mode = "single_active_chunk" if bool(zero_other_branch_scales) else "full"
+
+        valid_modes = {"full", "single_active_chunk"}
+        if vector_mode not in valid_modes:
+            raise ValueError(
+                f"Invalid vector_mode={vector_mode}. "
+                f"Expected one of {sorted(valid_modes)} or 'auto'."
+            )
+
+        self.vector_mode = vector_mode
+        self.zero_other_branch_scales = bool(vector_mode == "single_active_chunk")
+
+        layout = infer_optional_branchscale_layout(self.ckpt, self.vector_dim)
+
+        self.has_branchscale_layout = bool(layout["has_branchscale_layout"])
+        self.feature_families = layout["feature_families"]
+        self.scales = layout["scales"]
+        self.num_feature_branches = layout["num_feature_branches"]
+        self.num_scales = layout["num_scales"]
+        self.dims_per_subvector = layout["dims_per_subvector"]
+        self.num_subvectors = layout["num_subvectors"]
+
+        # Apply manual chunk overrides if provided.
+        if dims_per_subvector is not None:
+            self.dims_per_subvector = int(dims_per_subvector)
+
+        if num_subvectors is not None:
+            self.num_subvectors = int(num_subvectors)
+
+        if self.vector_mode == "single_active_chunk":
+            if self.dims_per_subvector is None:
+                raise ValueError(
+                    "vector_mode='single_active_chunk' requires dims_per_subvector. "
+                    "This checkpoint does not appear to contain branch-scale chunk metadata. "
+                    "Use vector_mode='full' for simple z-only MLP checkpoints."
+                )
+
+            if self.num_subvectors is None:
+                if self.vector_dim % self.dims_per_subvector != 0:
+                    raise ValueError(
+                        f"Cannot infer num_subvectors because vector_dim={self.vector_dim} "
+                        f"is not divisible by dims_per_subvector={self.dims_per_subvector}."
+                    )
+
+                self.num_subvectors = self.vector_dim // self.dims_per_subvector
+
+            expected_dim = self.num_subvectors * self.dims_per_subvector
+
+            if expected_dim != self.vector_dim:
+                raise ValueError(
+                    f"Chunk layout mismatch:\n"
+                    f"  vector_dim           = {self.vector_dim}\n"
+                    f"  num_subvectors       = {self.num_subvectors}\n"
+                    f"  dims_per_subvector   = {self.dims_per_subvector}\n"
+                    f"  expected_dim         = {expected_dim}\n"
+                )
+
+        # For full mode, chunk metadata is optional.
+        # If available, we return branchscale_subvectors.
+        # If unavailable, we return None for that field.
+
+    def describe(self):
+        return {
+            "checkpoint_path": self.checkpoint_path,
+            "mode": self.vector_mode,
+            "total_images": self.total_images,
+            "batch_size": self.batch_size,
+            "seed": self.seed,
+            "device": str(self.device),
+            "vector_dim": self.vector_dim,
+            "image_size": self.image_size,
+            "hidden": self.hidden,
+            "has_branchscale_layout": self.has_branchscale_layout,
+            "feature_families": self.feature_families,
+            "scales": self.scales,
+            "num_feature_branches": self.num_feature_branches,
+            "num_scales": self.num_scales,
+            "dims_per_subvector": self.dims_per_subvector,
+            "num_subvectors": self.num_subvectors,
+            "zero_other_branch_scales": self.zero_other_branch_scales,
+        }
+
+    def _maybe_view_subvectors(self, vectors):
+        """
+        Returns branch/chunk view if layout is known, otherwise None.
+
+        For simple z-only checkpoints, this returns None.
+        """
+
+        if self.dims_per_subvector is None:
+            return None
+
+        if self.num_subvectors is None:
+            return None
+
+        if self.num_subvectors * self.dims_per_subvector != self.vector_dim:
+            return None
+
+        return vectors.view(
+            vectors.shape[0],
+            self.num_subvectors,
+            self.dims_per_subvector,
+        )
+
+    @torch.no_grad()
+    def batches(self):
+        g = torch.Generator(device=self.device).manual_seed(self.seed)
+
+        generated = 0
+
+        while generated < self.total_images:
+            cur_bs = min(self.batch_size, self.total_images - generated)
+
+            if self.vector_mode == "single_active_chunk":
+                vectors, active_subvector_indices, active_subvectors, all_subvectors = (
+                    sample_single_active_chunk_vectors(
+                        batch_size=cur_bs,
+                        vector_dim=self.vector_dim,
+                        num_subvectors=self.num_subvectors,
+                        dims_per_subvector=self.dims_per_subvector,
+                        device=self.device,
+                        generator=g,
+                    )
+                )
+
+            else:
+                vectors = sample_gaussian_vectors(
+                    batch_size=cur_bs,
+                    vector_dim=self.vector_dim,
+                    device=self.device,
+                    generator=g,
+                )
+
+                all_subvectors = self._maybe_view_subvectors(vectors)
+
+                active_subvector_indices = torch.full(
+                    size=(cur_bs,),
+                    fill_value=-1,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+
+                active_subvectors = torch.empty(
+                    cur_bs,
+                    0,
+                    device=self.device,
+                )
+
+            images = self.generator(vectors)
+            images = (images.clamp(-1, 1) + 1.0) / 2.0
+
+            indices = torch.arange(
+                generated,
+                generated + cur_bs,
+                device=self.device,
+            )
+
+            generated += cur_bs
+
+            yield {
+                # Main outputs.
+                "images": images,                    # [B, 3, H, W], [0, 1]
+                "vectors": vectors,                  # [B, IN_DIM]
+                "indices": indices,                  # global synthetic index
+
+                # Optional branch/chunk outputs.
+                # For simple z-only checkpoints, branchscale_subvectors is None.
+                "branchscale_subvectors": all_subvectors,
+
+                # If vector_mode="single_active_chunk":
+                #   active_subvector_indices is [B]
+                #   active_subvectors is [B, dims_per_subvector]
+                #
+                # If vector_mode="full":
+                #   active_subvector_indices is all -1
+                #   active_subvectors is empty [B, 0]
+                "active_subvector_indices": active_subvector_indices,
+                "active_subvectors": active_subvectors,
+
+                # Metadata.
+                "vector_mode": self.vector_mode,
+                "zero_other_branch_scales": self.zero_other_branch_scales,
+                "has_branchscale_layout": self.has_branchscale_layout,
+            }
+
